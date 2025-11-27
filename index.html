@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>九九マスターチャレンジ</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, getDocs, collection, query, where, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firestoreのデバッグレベルを設定
+        setLogLevel('Debug');
+
+        // グローバル変数（Canvas環境から提供されるものを取得）
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig = {};
+        try {
+            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        } catch (e) {
+            console.error("Firebase config is invalid:", e);
+        }
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let unsubscribePersonalBest = null;
+        let unsubscribeDailyBest = null;
+
+        // UI要素
+        const startButton = document.getElementById('startButton');
+        const quizArea = document.getElementById('quizArea');
+        const recordsArea = document.getElementById('recordsArea');
+        const currentScore = document.getElementById('currentScore');
+        const personalBestDisplay = document.getElementById('personalBestDisplay');
+        const dailyBestDisplay = document.getElementById('dailyBestDisplay');
+        const congratsModal = document.getElementById('congratsModal');
+        const modalMessage = document.getElementById('modalMessage');
+        const modalCloseButton = document.getElementById('modalCloseButton');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+
+        // ゲーム状態
+        let problems = [];
+        let currentProblemIndex = 0;
+        let startTime = 0;
+        let personalBestTimeMs = Infinity; // 個人の最高記録（ミリ秒、小さいほど良い）
+        let dailyBestTimeMs = Infinity; // 一日の最高記録（ミリ秒、小さいほど良い）
+        
+        // Firestoreパス生成関数
+        const getPersonalBestDocRef = () => doc(db, `artifacts/${appId}/users/${userId}/kuku_practice_data`, 'personal_best');
+        const getDailyBestDocRef = () => doc(db, `artifacts/${appId}/public/data/kuku_practice_daily_best`, 'daily_best_record');
+        
+        // 日付をYYYY-MM-DD形式で取得
+        const getTodayDateString = () => {
+            return new Intl.DateTimeFormat('fr-CA', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+        };
+
+        // Firebase初期化と認証
+        const initializeFirebase = async () => {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase config is missing.");
+                    return;
+                }
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('userIdDisplay').textContent = `ユーザーID: ${userId}`;
+                        setupRealtimeListeners();
+                        loadingIndicator.classList.add('hidden');
+                        startButton.disabled = false;
+                    } else {
+                        userId = null;
+                        document.getElementById('userIdDisplay').textContent = 'ユーザーID: 未認証';
+                        loadingIndicator.classList.remove('hidden');
+                        startButton.disabled = true;
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization or authentication failed:", error);
+                loadingIndicator.textContent = '初期化エラー: コンソールを確認してください。';
+            }
+        };
+
+        // リアルタイムリスナー設定
+        const setupRealtimeListeners = () => {
+            if (!db || !userId) return;
+
+            // 1. 個人の最高記録リスナー
+            if (unsubscribePersonalBest) unsubscribePersonalBest();
+            unsubscribePersonalBest = onSnapshot(getPersonalBestDocRef(), (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    personalBestTimeMs = data.bestTimeMs || Infinity;
+                    personalBestDisplay.textContent = formatTime(personalBestTimeMs);
+                } else {
+                    personalBestTimeMs = Infinity;
+                    personalBestDisplay.textContent = 'なし';
+                }
+            }, (error) => console.error("Error reading personal best:", error));
+
+            // 2. 一日の最高記録リスナー
+            if (unsubscribeDailyBest) unsubscribeDailyBest();
+            unsubscribeDailyBest = onSnapshot(getDailyBestDocRef(), (docSnapshot) => {
+                const today = getTodayDateString();
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    if (data.date === today) {
+                        dailyBestTimeMs = data.bestTimeMs || Infinity;
+                        dailyBestDisplay.textContent = `${formatTime(dailyBestTimeMs)} (ID: ${data.bestUserId.substring(0, 4)}...)`;
+                    } else {
+                        // 日付が変わったらリセット
+                        dailyBestTimeMs = Infinity;
+                        dailyBestDisplay.textContent = '今日の記録はまだありません';
+                        // DB上の日付も更新
+                        resetDailyBest(today); 
+                    }
+                } else {
+                    dailyBestTimeMs = Infinity;
+                    dailyBestDisplay.textContent = '今日の記録はまだありません';
+                }
+            }, (error) => console.error("Error reading daily best:", error));
+        };
+
+        // 日付が変わった際にデイリーベストをリセット/初期化
+        const resetDailyBest = async (today) => {
+             try {
+                await setDoc(getDailyBestDocRef(), {
+                    date: today,
+                    bestTimeMs: Infinity,
+                    bestUserId: ''
+                }, { merge: true });
+                console.log("Daily best record initialized for new day:", today);
+            } catch (e) {
+                console.error("Error resetting daily best:", e);
+            }
+        }
+        
+        // 時間を整形 (ミリ秒 -> 秒.ミリ秒)
+        const formatTime = (ms) => {
+            if (ms === Infinity) return 'なし';
+            return (ms / 1000).toFixed(2) + '秒';
+        };
+
+        // 6, 7, 8, 9の段からランダムな九九の問題を5問生成
+        const generateProblems = () => {
+            problems = [];
+            const tables = [6, 7, 8, 9];
+            for (let i = 0; i < 5; i++) {
+                // 掛けられる数 (6, 7, 8, 9)
+                const factor1 = tables[Math.floor(Math.random() * tables.length)];
+                // 掛ける数 (1から9)
+                const factor2 = Math.floor(Math.random() * 9) + 1;
+                problems.push({
+                    q: `${factor1} × ${factor2}`,
+                    answer: factor1 * factor2,
+                    inputRef: null // 後でDOM要素を保持
+                });
+            }
+            return problems;
+        };
+
+        // クイズ開始
+        const startQuiz = () => {
+            if (!userId) {
+                // UIでエラー表示が望ましいが、今回はconsole.error
+                console.error("ユーザー認証が完了していません。");
+                return;
+            }
+            
+            // 問題を生成
+            generateProblems();
+            currentProblemIndex = 0;
+            startTime = Date.now();
+            currentScore.textContent = '計測中...';
+            quizArea.innerHTML = ''; // 問題エリアをクリア
+            
+            // 問題のレンダリング
+            problems.forEach((p, index) => {
+                const problemDiv = document.createElement('div');
+                problemDiv.className = 'flex items-center space-x-4 mb-4 p-3 bg-white rounded-lg shadow-md';
+                
+                const questionP = document.createElement('p');
+                questionP.className = 'text-2xl font-bold text-gray-700 w-1/3';
+                questionP.textContent = `第${index + 1}問: ${p.q} =`;
+
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.min = '1';
+                input.className = 'w-2/3 p-3 border-2 border-indigo-300 rounded-md text-xl focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 ease-in-out';
+                input.placeholder = '答えを入力';
+                input.id = `input-${index}`;
+                
+                // Enterキーで次の問題へ
+                input.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        // 現在の入力フィールドを見つけ、次の入力フィールドにフォーカスを移す
+                        const nextIndex = index + 1;
+                        if (nextIndex < problems.length) {
+                            document.getElementById(`input-${nextIndex}`).focus();
+                        } else {
+                            // 最後の問題でEnterが押されたら採点
+                            submitQuiz();
+                        }
+                    }
+                });
+                
+                problemDiv.appendChild(questionP);
+                problemDiv.appendChild(input);
+                quizArea.appendChild(problemDiv);
+                
+                // input要素への参照を保存
+                p.inputRef = input;
+            });
+            
+            // 採点ボタン
+            const submitButton = document.createElement('button');
+            submitButton.id = 'submitButton';
+            submitButton.className = 'w-full py-3 mt-4 bg-green-500 hover:bg-green-600 text-white font-bold rounded-lg transition duration-150 ease-in-out shadow-lg';
+            submitButton.textContent = '採点する！';
+            submitButton.onclick = submitQuiz;
+            quizArea.appendChild(submitButton);
+
+            startButton.textContent = 'もう一度チャレンジ';
+            // 最初の問題にフォーカス
+            document.getElementById('input-0').focus();
+        };
+
+        // クイズ提出と採点
+        const submitQuiz = () => {
+            const endTime = Date.now();
+            let correctCount = 0;
+            let totalTimeMs = endTime - startTime;
+            
+            problems.forEach((p, index) => {
+                const inputElement = document.getElementById(`input-${index}`);
+                const userAnswer = parseInt(inputElement.value, 10);
+                
+                // 採点とUIフィードバック
+                if (userAnswer === p.answer) {
+                    correctCount++;
+                    inputElement.parentElement.classList.remove('bg-white');
+                    inputElement.parentElement.classList.add('bg-green-100', 'border-l-4', 'border-green-500');
+                    inputElement.disabled = true;
+                } else {
+                    inputElement.parentElement.classList.remove('bg-white');
+                    inputElement.parentElement.classList.add('bg-red-100', 'border-l-4', 'border-red-500');
+                    inputElement.disabled = true;
+                    // 正しい答えを表示（オプション）
+                    const answerSpan = document.createElement('span');
+                    answerSpan.className = 'text-sm text-red-600 font-semibold ml-2';
+                    answerSpan.textContent = `正解: ${p.answer}`;
+                    inputElement.parentElement.appendChild(answerSpan);
+                }
+            });
+
+            const submitButton = document.getElementById('submitButton');
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.textContent = '採点完了';
+            }
+
+            // 全問正解かつ時間計測が有効な場合のみ記録を更新
+            if (correctCount === problems.length && totalTimeMs > 0) {
+                currentScore.textContent = `スコア: ${formatTime(totalTimeMs)} (全問正解!)`;
+                checkAndUpdateRecords(totalTimeMs);
+            } else {
+                currentScore.textContent = `スコア: 失敗 (${correctCount}/${problems.length}問正解)`;
+            }
+        };
+
+        // 記録をチェックし、必要に応じて更新
+        const checkAndUpdateRecords = async (newTimeMs) => {
+            let isPersonalBest = false;
+            let isDailyBest = false;
+            
+            // 1. 個人の最高記録をチェック・更新
+            if (newTimeMs < personalBestTimeMs) {
+                isPersonalBest = true;
+                await setDoc(getPersonalBestDocRef(), { bestTimeMs: newTimeMs });
+                console.log("Personal best updated:", newTimeMs);
+            }
+
+            // 2. 一日の最高記録をチェック・更新 (トランザクションを使用)
+            const dailyRef = getDailyBestDocRef();
+            const today = getTodayDateString();
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const dailyDoc = await transaction.get(dailyRef);
+                    let currentDailyBest = Infinity;
+                    let dailyData = { date: today, bestTimeMs: Infinity, bestUserId: userId };
+
+                    if (dailyDoc.exists()) {
+                        dailyData = dailyDoc.data();
+                        currentDailyBest = dailyData.bestTimeMs || Infinity;
+                    }
+
+                    // 日付が変わっているかチェック
+                    if (dailyData.date !== today || currentDailyBest === Infinity) {
+                        // 新しい日、またはまだ記録がない場合
+                        dailyData = { date: today, bestTimeMs: newTimeMs, bestUserId: userId };
+                        isDailyBest = true;
+                    } else if (newTimeMs < currentDailyBest) {
+                        // 既存の記録より速い場合
+                        dailyData.bestTimeMs = newTimeMs;
+                        dailyData.bestUserId = userId;
+                        isDailyBest = true;
+                    } else {
+                        isDailyBest = false;
+                    }
+
+                    if (isDailyBest) {
+                        transaction.set(dailyRef, dailyData);
+                        console.log("Daily best updated:", newTimeMs);
+                    }
+                });
+            } catch (e) {
+                console.error("Daily best transaction failed:", e);
+            }
+
+            // 3. お祝いメッセージ
+            if (isPersonalBest || isDailyBest) {
+                showCongrats(isPersonalBest, isDailyBest, newTimeMs);
+            }
+        };
+        
+        // お祝いメッセージ表示
+        const showCongrats = (isPersonal, isDaily, timeMs) => {
+            let message = `タイム: ${formatTime(timeMs)}で、見事な記録です！\n\n`;
+            if (isPersonal) {
+                message += '🏆 個人の最高記録を更新しました！おめでとうございます！\n';
+            }
+            if (isDaily) {
+                message += '🥇 今日の一日の最高記録を達成しました！素晴らしい！\n';
+            }
+            
+            modalMessage.textContent = message;
+            congratsModal.classList.remove('hidden');
+        }
+
+        // モーダルを閉じる
+        modalCloseButton.onclick = () => {
+            congratsModal.classList.add('hidden');
+        };
+
+        // イベントリスナー設定
+        window.onload = () => {
+            initializeFirebase();
+            startButton.onclick = startQuiz;
+        };
+
+        // グローバルにエクスポートしてHTMLからアクセス可能にする (Type="module"を使用しているため、これは必要ないが念のため)
+        window.startQuiz = startQuiz;
+        window.submitQuiz = submitQuiz;
+
+    </script>
+    <style>
+        /* カスタムスタイル */
+        @keyframes pulse-success {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .congrats-card {
+            animation: pulse-success 0.5s ease-in-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+
+    <div class="max-w-4xl mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-2xl">
+        <h1 class="text-4xl font-extrabold text-indigo-700 mb-6 text-center">九九マスターチャレンジ</h1>
+        <p id="userIdDisplay" class="text-sm text-gray-500 text-center mb-4">ユーザーID: ロード中...</p>
+
+        <!-- ロードインジケータ -->
+        <div id="loadingIndicator" class="text-center p-4">
+            <div class="animate-spin inline-block w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full" role="status"></div>
+            <p class="text-indigo-600 mt-2">データと認証をロード中...</p>
+        </div>
+
+        <!-- 記録エリア -->
+        <div id="recordsArea" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <div class="bg-blue-100 p-4 rounded-lg shadow-inner text-center">
+                <p class="text-sm font-semibold text-blue-700">現在のスコア</p>
+                <p id="currentScore" class="text-3xl font-extrabold text-blue-900 mt-1">未挑戦</p>
+            </div>
+            <div class="bg-purple-100 p-4 rounded-lg shadow-inner text-center">
+                <p class="text-sm font-semibold text-purple-700">個人の最高記録</p>
+                <p id="personalBestDisplay" class="text-3xl font-extrabold text-purple-900 mt-1">ロード中</p>
+            </div>
+            <div class="bg-yellow-100 p-4 rounded-lg shadow-inner text-center">
+                <p class="text-sm font-semibold text-yellow-700">今日の一日の最高記録</p>
+                <p id="dailyBestDisplay" class="text-3xl font-extrabold text-yellow-900 mt-1">ロード中</p>
+            </div>
+        </div>
+
+        <!-- コントロールと説明 -->
+        <div class="text-center mb-8 p-6 bg-indigo-50 rounded-lg border-l-4 border-indigo-400">
+            <p class="text-gray-700 mb-4">
+                <span class="font-bold">ルール:</span> 6, 7, 8, 9の段からランダムに5問出題されます。全問正解するまでのタイムを競います。
+            </p>
+            <button id="startButton" disabled class="w-full sm:w-1/2 py-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xl rounded-lg shadow-lg transition duration-300 ease-in-out transform hover:scale-105 disabled:bg-indigo-300">
+                チャレンジ開始 (5問)
+            </button>
+        </div>
+
+        <!-- クイズエリア -->
+        <div id="quizArea" class="mt-8">
+            <!-- 問題がここに動的に挿入されます -->
+        </div>
+    </div>
+    
+    <!-- お祝いモーダル -->
+    <div id="congratsModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 hidden">
+        <div class="bg-white p-8 rounded-xl shadow-2xl max-w-sm w-full text-center congrats-card border-4 border-yellow-500">
+            <div class="text-6xl mb-4">🎉</div>
+            <h3 class="text-3xl font-bold text-green-600 mb-4">記録達成！</h3>
+            <p id="modalMessage" class="text-lg text-gray-700 whitespace-pre-line"></p>
+            <button id="modalCloseButton" class="mt-6 py-2 px-6 bg-indigo-500 hover:bg-indigo-600 text-white font-semibold rounded-lg transition duration-150">
+                閉じる
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
